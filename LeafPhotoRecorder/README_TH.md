@@ -19,3 +19,26 @@ GPIO2 ตั้งเป็น Active HIGH หากบอร์ดของค�
 เมื่อเขียนไม่สำเร็จ โปรแกรมจะหยุดชุดถ่ายและแจ้งบนเว็บกับ Serial ให้ตรวจพื้นที่หรือเสียบการ์ดใหม่ขณะปิดไฟ เครือข่ายเป็นแบบเปิด คนที่อยู่ในระยะ Wi-Fi สามารถดูภาพและกดถ่ายได้
 
 เฟิร์มแวร์เปิด `CANOPY_AI_ENABLED=1` และใช้หัวไฟล์ `Trakan-project-1_inferencing.h` ติดตั้ง `../model/plant_fomo_int8_arduino_v2.zip` ผ่าน Sketch → Include Library → Add .ZIP Library ก่อนกด Verify ไฟล์ `build_opt.h` ปิด ESP-NN เพื่อหลีกเลี่ยงการรีสตาร์ตระหว่างรันโมเดลบนบอร์ดที่ทดสอบ หากต้องการคอมไพล์เฉพาะส่วนถ่ายภาพ ให้ตั้ง `CANOPY_AI_ENABLED=0` ใน `canopy_ai.h`
+
+## โหมดประหยัดพลังงาน (Deep Sleep) และส่งผลไปแดชบอร์ด — FW 2.1.0
+
+- **เปิดไฟหรือกด RST** บอร์ดจะเข้า **โหมดตั้งค่า** เปิด Wi-Fi `PlantCam-xxxx` และหน้าเว็บ `http://192.168.4.1` เหมือนเดิม ใช้จัดตำแหน่งกล้อง ทดลองถ่าย และตั้งค่าในการ์ด **ตั้งค่าส่งผลไปแดชบอร์ด**
+  - ใส่ Wi-Fi ของฟาร์ม, MQTT host/port/user/รหัสผ่าน, topic prefix (ค่าเริ่มต้น `PCAT_Kit`), รหัสเครื่อง (ค่าเริ่มต้น `CAM` ตามด้วยรหัส MAC) และรอบการตื่น (นาที, ค่าเริ่มต้น 60)
+  - การตั้งค่าเก็บใน NVS จึงไม่หายเมื่อดับไฟ
+- กด **เริ่มทำงานอัตโนมัติ** หรือปล่อยหน้าเว็บไว้โดยไม่มีคนเปิดดู 10 นาที บอร์ดจะเข้า **โหมดอัตโนมัติ**
+- ทุกครั้งที่ตื่นด้วยตัวตั้งเวลา บอร์ดจะ: ถ่าย 3 รูปลง SD → รัน AI และวัดพุ่ม → ต่อ Wi-Fi → ส่งภาพล่าสุด (JPEG) ไปที่ `<prefix>/<devId>/plantcam/image` → ส่งผล JSON ไปที่ MQTT topic `<prefix>/<devId>/plantcam` (retained) และ `<prefix>/<devId>/status` = `sleeping` → **deep sleep** ตามจำนวนนาทีที่ตั้ง
+- ภาพยังเก็บใน run folder เดิมต่อเนื่องระหว่างรอบหลับ ค่าพุ่มครั้งก่อนเก็บใน RTC memory (หายเมื่อถอดไฟ)
+- ถ้าต่อ Wi-Fi/MQTT ไม่ได้ บอร์ดยังบันทึกผลลง `/lettuce/canopy.csv` แล้วหลับตามปกติ
+
+ตัวอย่างข้อมูลที่ส่ง:
+
+```json
+{"dev":"CAM1A2B3C","fw":"2.1.0","ok":true,"cycle":5,"batch":5,"photos":15,"valid_samples":3,
+ "canopy_percent":42.1,"change_previous_percent":3.2,"growth_baseline_percent":18.5,"baseline_percent":35.5,
+ "ai_state":"plant_found","ai_x":160,"ai_y":118,"ai_confidence":0.82,"ai_elapsed_ms":2434,
+ "errors":0,"sd_free_mb":29000,"rssi":-61,"sleep_min":60,"message":"AI found plant; 3 photos saved and canopy measured"}
+```
+
+หมายเหตุ: บอร์ดนี้ไม่มีขา PWDN ของกล้อง (`pin_pwdn=-1`) โมดูลกล้องและ SD จึงยังกินไฟเล็กน้อยระหว่างหลับ ถ้าใช้แบตเตอรี่ควรวัดกระแสจริง
+
+แดชบอร์ด PCAT Smart Farm Kit (`https://iot.pcat.in.th/Smart_PCAT`) หน้าแรกมีแผง **PlantCam วัดพื้นที่พุ่มพืช** แสดงภาพล่าสุด ค่าพุ่ม การเปลี่ยนแปลง กราฟย้อนหลัง 60 ครั้ง และเตือนเมื่อกล้องเลยเวลาตื่น
