@@ -43,6 +43,7 @@ bool cardMounted = false;
 bool cameraReady = false;
 uint8_t photosRemaining = 0;
 uint8_t validMeasurements = 0;
+uint8_t batchAnalysed = 0; // photos of this round that went through the AI
 uint8_t *rgbBuffer = nullptr;
 uint64_t batchGreenPixels = 0;
 uint64_t batchRoiPixels = 0;
@@ -61,7 +62,7 @@ float batchConfidenceSum = 0;
 String recorderStatus = "Starting";
 
 // ---------- Deep sleep + dashboard ----------
-constexpr char FW_VERSION[] = "2.3.1";
+constexpr char FW_VERSION[] = "2.4.2";
 constexpr uint32_t SETUP_IDLE_MS = 10UL * 60 * 1000; // setup web idle -> sleep
 constexpr uint32_t WIFI_TIMEOUT_MS = 20000;
 constexpr uint32_t MQTT_TIMEOUT_MS = 10000;
@@ -90,6 +91,9 @@ bool autoMode = false;      // true = woke from timer: capture, send, sleep
 uint32_t lastWebActivity = 0;
 bool sleepRequested = false;
 bool otaRebootPending = false;
+bool wifiFailed = false;      // STA connect failed -> open the setup AP
+bool setupRequested = false;  // dashboard sent "setup"
+bool setupFromTimer = false;  // setup AP opened after a timer wake
 
 const char WEB_PAGE[] PROGMEM = R"HTML(
 <!doctype html><html lang="th"><head><meta charset="utf-8">
@@ -411,7 +415,14 @@ String resultJson(bool ok) {
   j += ",\"change_previous_percent\":" + jsonNum(ok ? changeFromPrevious : NAN, 4);
   j += ",\"growth_baseline_percent\":" + jsonNum(ok ? growthFromBaseline : NAN, 4);
   j += ",\"baseline_percent\":" + jsonNum(baselineCanopyPercent, 4);
-  j += ",\"ai_state\":\"" + String(canopyAIState) + "\"";
+  // Result of the whole 3-photo round, not just the last photo.
+  j += ",\"ai_state\":\"" +
+       String(validMeasurements > 0 ? "plant_found"
+              : batchAnalysed > 0   ? "plant_not_found"
+                                    : canopyAIState) +
+       "\"";
+  j += ",\"ai_found\":" + String(validMeasurements);
+  j += ",\"ai_total\":" + String(batchAnalysed);
   j += ",\"ai_x\":" + (plantCenterX >= 0 ? String(plantCenterX) : String("null"));
   j += ",\"ai_y\":" + (plantCenterY >= 0 ? String(plantCenterY) : String("null"));
   j += ",\"ai_confidence\":" + (plantCenterX >= 0 ? String(plantConfidence, 4) : String("null"));
@@ -529,7 +540,8 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
 // command on <topic>/<devId>/cmd. Returns true only for "ai" / "measure".
 bool checkDashboardCommand() {
   if (cfg.ssid.isEmpty() || cfg.mqttHost.isEmpty()) {
-    Serial.println("Command: Wi-Fi/MQTT not configured -> no AI run");
+    Serial.println("Command: Wi-Fi/MQTT not configured -> setup AP");
+    wifiFailed = true;
     return false;
   }
   WiFi.mode(WIFI_STA);
@@ -538,7 +550,9 @@ bool checkDashboardCommand() {
   while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_TIMEOUT_MS)
     delay(100);
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Command: Wi-Fi connect failed");
+    Serial.println("Command: Wi-Fi connect failed -> setup AP");
+    wifiFailed = true;
+    WiFi.disconnect(true);
     return false;
   }
   String base = cfg.mqttTopic + "/" + cfg.devId;
@@ -568,6 +582,17 @@ bool checkDashboardCommand() {
   }
   bool run = pendingCommand == "ai" || pendingCommand == "measure";
   bool ota = pendingCommand == "ota";
+  setupRequested = pendingCommand == "setup";
+  // "sleep <minutes>": change the wake interval remotely (1-1440, saved in NVS)
+  bool sleepCmd = pendingCommand.startsWith("sleep ");
+  if (sleepCmd) {
+    long minutes = pendingCommand.substring(6).toInt();
+    if (minutes >= 1 && minutes <= 1440 && minutes != cfg.sleepMinutes) {
+      cfg.sleepMinutes = minutes;
+      saveConfig();
+    }
+    Serial.printf("Command: wake every %u min\n", cfg.sleepMinutes);
+  }
   String ping = "{\"dev\":\"" + cfg.devId + "\",\"fw\":\"" + FW_VERSION +
                 "\",\"cycle\":" + String(rtcCycles) +
                 ",\"rssi\":" + String(WiFi.RSSI()) +
@@ -577,7 +602,7 @@ bool checkDashboardCommand() {
   mqtt.publish((base + "/plantcam/ping").c_str(), ping.c_str());
   mqtt.publish(statusTopic.c_str(),
                run ? "measuring" : ota ? "updating" : "sleeping", true);
-  if (run || ota) // consume the one-shot command (clear the retained message)
+  if (run || ota || setupRequested || sleepCmd) // consume the one-shot command (clear the retained message)
     mqtt.publish(cmdTopic.c_str(), (const uint8_t *)"", 0, true);
   if (ota) {
     for (int i = 0; i < 10; ++i) {
@@ -647,9 +672,13 @@ String runOtaUpdate() {
 }
 
 // Timer wake: run the camera + AI only when the dashboard asked for it.
+// Returns only when the setup AP should be opened (Wi-Fi failed / "setup").
 void runAutoCycle() {
   ++rtcCycles;
-  if (!checkDashboardCommand())
+  bool run = checkDashboardCommand();
+  if (wifiFailed || setupRequested)
+    return;
+  if (!run)
     goToSleep((uint64_t)cfg.sleepMinutes * 60);
   cameraReady = startCamera();
   bool cardReady = cameraReady && startCard();
@@ -689,6 +718,7 @@ void startCaptureBatch() {
     return;
   photosRemaining = 3;
   validMeasurements = 0;
+  batchAnalysed = 0;
   batchGreenPixels = 0;
   batchRoiPixels = 0;
   batchCenterXSum = 0;
@@ -915,6 +945,7 @@ void captureAndSave() {
   uint32_t roiPixels = 0;
   bool measured = saved && measureCanopy(*frame, greenPixels, roiPixels);
   if (saved) {
+    ++batchAnalysed;
     Serial.printf("Canopy AI: %s (%lu ms)\n", canopyAIState,
                   (unsigned long)canopyAIElapsedMs);
   }
@@ -961,10 +992,15 @@ void setup() {
     rtcMagic = 0; // power-on / RST: start a new run folder
   }
   loadConfig();
-  Serial.printf("PlantCam FW %s, dev %s, %s mode\n", FW_VERSION,
-                cfg.devId.c_str(), autoMode ? "AUTO (timer wake)" : "SETUP");
-  if (autoMode)
-    runAutoCycle(); // never returns
+  Serial.printf("PlantCam FW %s, dev %s, %s\n", FW_VERSION, cfg.devId.c_str(),
+                autoMode ? "timer wake" : "power-on");
+  // Wi-Fi works -> no setup web at all (saves CPU/power): check, work, sleep.
+  runAutoCycle(); // returns only when Wi-Fi failed or "setup" was requested
+  setupFromTimer = autoMode;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.printf("SETUP mode: %s\n", setupRequested ? "requested by dashboard"
+                                                   : "Wi-Fi not connected");
   cameraReady = startCamera();
   bool cardReady = cameraReady && startCard();
   if (cardReady)
@@ -975,7 +1011,10 @@ void setup() {
     Serial.println(recorderStatus);
     return;
   }
-  recorderStatus = "Ready; press Capture 3 Photos";
+  recorderStatus = setupRequested
+                       ? "Setup requested from dashboard"
+                       : "Cannot connect to Wi-Fi '" + cfg.ssid +
+                             "' - check settings below";
   recording = false;
   Serial.printf("Ready at %s. Send c to capture 3 photos.\n", sessionPath);
 }
@@ -992,7 +1031,10 @@ void loop() {
   if (!recording &&
       (sleepRequested || now - lastWebActivity >= SETUP_IDLE_MS)) {
     delay(300); // let the HTTP reply go out
-    goToSleep(1);
+    // Idle after a failed timer wake: wait a full cycle before retrying Wi-Fi.
+    goToSleep(setupFromTimer && !sleepRequested
+                  ? (uint64_t)cfg.sleepMinutes * 60
+                  : 1);
   }
   if (ledLit && now - ledStarted >= BLINK_MS) {
     digitalWrite(LED_PIN, LED_OFF);
