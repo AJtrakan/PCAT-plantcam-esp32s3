@@ -60,7 +60,7 @@ float batchConfidenceSum = 0;
 String recorderStatus = "Starting";
 
 // ---------- Deep sleep + dashboard ----------
-constexpr char FW_VERSION[] = "2.6.2";
+constexpr char FW_VERSION[] = "2.6.6";
 constexpr uint32_t SETUP_IDLE_MS = 10UL * 60 * 1000; // setup web idle -> sleep
 constexpr uint32_t WIFI_TIMEOUT_MS = 20000;
 constexpr uint32_t MQTT_TIMEOUT_MS = 10000;
@@ -74,6 +74,8 @@ RTC_DATA_ATTR unsigned rtcPhotoNumber = 0;
 RTC_DATA_ATTR unsigned rtcBatchNumber = 0;
 RTC_DATA_ATTR float rtcCanopyPercent = NAN;
 RTC_DATA_ATTR uint32_t rtcCycles = 0;
+RTC_DATA_ATTR bool rtcRestartBoot = false; // next wake is the reboot after detection
+bool resultEchoed = false; // our own result came back from the broker
 
 struct Config {
   String ssid, pass, devId, mqttHost, mqttUser, mqttPass, mqttTopic;
@@ -577,15 +579,29 @@ bool publishResult(bool ok) {
     if (mqtt.connect(clientId.c_str(), cfg.mqttUser.c_str(),
                      cfg.mqttPass.c_str(), statusTopic.c_str(), 0, true,
                      "sleeping")) {
-      publishLatestPhoto(base + "/plantcam/image");
-      publishAnalysisImage(base + "/plantcam/result");
       // Not retained: RabbitMQ may pass the retain flag on to live
       // subscribers and the dashboard ignores retained (replayed) results.
-      sent = mqtt.publish((base + "/plantcam").c_str(), payload.c_str(), false);
-      mqtt.publish(statusTopic.c_str(), "sleeping", true);
+      // Subscribe to our own result topic: when the broker echoes the result
+      // back, everything sent before it on this connection has arrived.
+      String resultTopic = base + "/plantcam";
+      mqtt.setCallback(onMqttMessage);
+      mqtt.subscribe(resultTopic.c_str());
+      resultEchoed = false;
+      sent = mqtt.publish(resultTopic.c_str(), payload.c_str(), false);
+      // Result first (small, most important), then the two images.
       mqtt.loop();
-      delay(200);
+      publishLatestPhoto(base + "/plantcam/image");
+      publishAnalysisImage(base + "/plantcam/result");
+      mqtt.publish(statusTopic.c_str(), "sleeping", true);
+      uint32_t waitStart = millis();
+      while (!resultEchoed && millis() - waitStart < 8000) {
+        mqtt.loop();
+        delay(20);
+      }
+      Serial.printf("Dashboard: delivery %s\n", resultEchoed ? "confirmed" : "NOT confirmed");
+      sent = sent && resultEchoed;
       mqtt.disconnect();
+      delay(300);
     } else {
       delay(500);
     }
@@ -620,6 +636,11 @@ void goToSleep(uint64_t seconds) {
 String pendingCommand;
 
 void onMqttMessage(char *topic, byte *payload, unsigned int length) {
+  size_t tl = strlen(topic);
+  if (tl > 9 && strcmp(topic + tl - 9, "/plantcam") == 0) {
+    resultEchoed = true; // delivery confirmed (broker keeps per-connection order)
+    return;
+  }
   pendingCommand = "";
   for (unsigned i = 0; i < length && i < 32; ++i)
     pendingCommand += (char)payload[i];
@@ -761,7 +782,20 @@ void runAutoCycle() {
   }
   Serial.println(recorderStatus);
   publishResult(ok);
-  goToSleep((uint64_t)cfg.sleepMinutes * 60);
+  restartAfterRound();
+}
+
+// After a detection round: reboot the board once (frees camera/AI memory,
+// clears the camera driver state). RTC memory survives a software reset, so
+// the run folder and counters carry on; the reboot then checks commands and
+// goes back to its normal sleep cycle.
+void restartAfterRound() {
+  // Reboot once through a 1 s deep sleep. That boot does nothing else and
+  // goes straight back to the normal cycle, so the camera (no PWDN/RESET
+  // pin) gets time to settle before it is used again.
+  Serial.println("Detection done: restarting once");
+  rtcRestartBoot = true;
+  goToSleep(1);
 }
 
 void startCaptureBatch() {
@@ -996,14 +1030,22 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LED_OFF);
   Serial.begin(115200);
-  autoMode = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+  // The reboot after a detection round (software reset) continues the same
+  // run like a timer wake; only power-on / RST starts a new run folder.
+  autoMode = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER ||
+             (esp_reset_reason() == ESP_RST_SW && rtcMagic == RTC_MAGIC);
   if (!autoMode) {
     delay(1200);
     rtcMagic = 0; // power-on / RST: start a new run folder
   }
   loadConfig();
   Serial.printf("PlantCam FW %s, dev %s, %s\n", FW_VERSION, cfg.devId.c_str(),
-                autoMode ? "timer wake" : "power-on");
+                esp_reset_reason() == ESP_RST_SW ? "restart after detection" : autoMode ? "timer wake" : "power-on");
+  if (autoMode && rtcRestartBoot) {
+    rtcRestartBoot = false;
+    Serial.println("Restart after detection done: back to the normal cycle");
+    goToSleep((uint64_t)cfg.sleepMinutes * 60);
+  }
   // Wi-Fi works -> no setup web at all (saves CPU/power): check, work, sleep.
   runAutoCycle(); // returns only when Wi-Fi failed or "setup" was requested
   setupFromTimer = autoMode;
