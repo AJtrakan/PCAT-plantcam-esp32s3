@@ -6,6 +6,9 @@
 #include <WiFi.h>
 #include <esp_camera.h>
 #include <esp_sleep.h>
+#include <HTTPUpdate.h>
+#include <Update.h>
+#include <WiFiClientSecure.h>
 #include <esp_random.h>
 #include <img_converters.h>
 #include <math.h>
@@ -58,10 +61,11 @@ float batchConfidenceSum = 0;
 String recorderStatus = "Starting";
 
 // ---------- Deep sleep + dashboard ----------
-constexpr char FW_VERSION[] = "2.1.0";
+constexpr char FW_VERSION[] = "2.3.1";
 constexpr uint32_t SETUP_IDLE_MS = 10UL * 60 * 1000; // setup web idle -> sleep
 constexpr uint32_t WIFI_TIMEOUT_MS = 20000;
 constexpr uint32_t MQTT_TIMEOUT_MS = 10000;
+constexpr uint32_t CMD_WAIT_MS = 3000; // wait for retained cmd after subscribe
 constexpr uint32_t RTC_MAGIC = 0x504C4341; // "PLCA"
 
 // Survives deep sleep (lost on power-off).
@@ -76,6 +80,7 @@ struct Config {
   String ssid, pass, devId, mqttHost, mqttUser, mqttPass, mqttTopic;
   uint16_t mqttPort = 1883;
   uint16_t sleepMinutes = 60;
+  String otaUrl;
 } cfg;
 
 Preferences prefs;
@@ -84,6 +89,7 @@ PubSubClient mqtt(netClient);
 bool autoMode = false;      // true = woke from timer: capture, send, sleep
 uint32_t lastWebActivity = 0;
 bool sleepRequested = false;
+bool otaRebootPending = false;
 
 const char WEB_PAGE[] PROGMEM = R"HTML(
 <!doctype html><html lang="th"><head><meta charset="utf-8">
@@ -101,17 +107,18 @@ const char WEB_PAGE[] PROGMEM = R"HTML(
 <label>รหัสเครื่อง (devId)<input name="devId" id="c_devId"></label><label>MQTT host<input name="mHost" id="c_mHost"></label>
 <label>MQTT port<input name="mPort" id="c_mPort" type="number"></label><label>MQTT user<input name="mUser" id="c_mUser"></label>
 <label>MQTT รหัสผ่าน<input name="mPass" type="password" placeholder="(เว้นว่าง = ใช้ค่าเดิม)"></label><label>MQTT topic prefix<input name="mTopic" id="c_mTopic"></label>
-<label>ตื่นมาวัดทุก (นาที)<input name="sleepMin" id="c_sleepMin" type="number" min="1" max="1440"></label>
+<label>ตื่นมาเช็คคำสั่งทุก (นาที)<input name="sleepMin" id="c_sleepMin" type="number" min="1" max="1440"></label>
+<label>OTA URL (เฟิร์มแวร์จากแดชบอร์ด)<input name="otaUrl" id="c_otaUrl"></label>
 <button type="submit">บันทึกการตั้งค่า</button></form>
 <form method="post" action="/api/sleep"><button type="submit" style="background:#8a4b00">เริ่มทำงานอัตโนมัติ (วัด → ส่ง → หลับ)</button></form>
-<p class="muted">ผลส่งไปที่ topic <b id="c_topic">-</b> • ถ้าไม่มีการใช้งานหน้าเว็บ 10 นาที บอร์ดจะเริ่มโหมดอัตโนมัติเอง • กด RST เพื่อกลับมาหน้านี้</p></div>
+<p class="muted">ผลส่งไปที่ topic <b id="c_topic">-</b> • ถ้าไม่มีการใช้งานหน้าเว็บ 10 นาที บอร์ดจะเริ่มโหมดอัตโนมัติเอง • กด RST เพื่อกลับมาหน้านี้ • <a href="/update" style="background:#555">อัปเดตเฟิร์มแวร์ (OTA)</a></p></div>
 <div class="card"><h2>ภาพตัวอย่างสด</h2><div class="preview-wrap"><img id="preview" src="/preview.jpg" alt="กำลังเปิดกล้อง"><div class="roi" id="roi" style="display:none"></div></div><p class="muted">หลังถ่าย วงกลมจะแสดงบริเวณที่ AI พบต้นและใช้วัดพุ่ม ภาพตัวอย่างไม่ถูกบันทึกลง SD</p></div>
 <div class="card"><h2>ภาพล่าสุด</h2><img id="latest" alt="ยังไม่มีภาพ"></div>
 <div class="card"><h2>12 ภาพล่าสุด</h2><div class="gallery" id="gallery"></div></div>
 <script>
 const stateText=document.getElementById('state'),countText=document.getElementById('count'),errorText=document.getElementById('errors'),freeText=document.getElementById('free'),messageText=document.getElementById('message'),canopyText=document.getElementById('canopy'),previousText=document.getElementById('previous'),baselineText=document.getElementById('baseline'),aiText=document.getElementById('ai'),roi=document.getElementById('roi'),previewImage=document.getElementById('preview'),latestImage=document.getElementById('latest'),downloadLink=document.getElementById('download'),galleryBox=document.getElementById('gallery');let lastCount=-1,isCapturing=false;
 async function refresh(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());isCapturing=s.recording;stateText.textContent=s.recording?'กำลังถ่ายชุด ('+s.remaining+' รูป)':'พร้อมถ่าย';countText.textContent=s.photos;errorText.textContent=s.errors;freeText.textContent=s.sd_free_mb===null?'-':s.sd_free_mb+' MB';messageText.textContent=s.message;canopyText.textContent=s.canopy_percent===null?'-':s.canopy_percent.toFixed(2)+'%';previousText.textContent=s.change_previous_percent===null?'-':(s.change_previous_percent>=0?'+':'')+s.change_previous_percent.toFixed(2)+'%';baselineText.textContent=s.growth_baseline_percent===null?'-':(s.growth_baseline_percent>=0?'+':'')+s.growth_baseline_percent.toFixed(2)+'%';aiText.textContent=s.ai_state==='plant_found'?(s.ai_confidence*100).toFixed(1)+'%':s.ai_state;if(s.ai_x!==null){roi.style.display='block';roi.style.left=((s.ai_x-96)/320*100)+'%';roi.style.top=((s.ai_y-96)/240*100)+'%'}else roi.style.display='none';if(s.photos>0){latestImage.src='/latest.jpg?v='+s.photos;downloadLink.href='/latest.jpg?v='+s.photos}if(s.photos!==lastCount){lastCount=s.photos;const a=await fetch('/api/recent',{cache:'no-store'}).then(r=>r.json());galleryBox.replaceChildren(...a.map(x=>{const l=document.createElement('a');l.href=x.url;l.target='_blank';const i=document.createElement('img');i.src=x.url;i.loading='lazy';i.alt='ภาพ '+x.number;l.append(i);return l}))}}catch(e){messageText.textContent='เชื่อมต่อบอร์ดไม่ได้'}}function refreshPreview(){if(!isCapturing)previewImage.src='/preview.jpg?t='+Date.now()}refresh();setInterval(refresh,1000);setInterval(refreshPreview,800);
-fetch('/api/config',{cache:'no-store'}).then(r=>r.json()).then(c=>{for(const k of ['ssid','devId','mHost','mPort','mUser','mTopic','sleepMin'])document.getElementById('c_'+k).value=c[k];document.getElementById('c_topic').textContent=c.mTopic+'/'+c.devId+'/plantcam'}).catch(()=>{});
+fetch('/api/config',{cache:'no-store'}).then(r=>r.json()).then(c=>{for(const k of ['ssid','devId','mHost','mPort','mUser','mTopic','sleepMin','otaUrl'])document.getElementById('c_'+k).value=c[k];document.getElementById('c_topic').textContent=c.mTopic+'/'+c.devId+'/plantcam'}).catch(()=>{});
 </script></body></html>)HTML";
 
 bool startCamera() {
@@ -361,6 +368,8 @@ void loadConfig() {
   cfg.mqttPass = prefs.getString("mPass", "");
   cfg.mqttTopic = prefs.getString("mTopic", "PCAT_Kit");
   cfg.sleepMinutes = prefs.getUShort("sleepMin", 60);
+  cfg.otaUrl = prefs.getString(
+      "otaUrl", "https://iot.pcat.in.th/Smart_PCAT/api/plantcam/firmware");
   prefs.end();
   if (cfg.devId.isEmpty())
     cfg.devId = "CAM" + macId();
@@ -383,6 +392,7 @@ void saveConfig() {
   prefs.putString("mPass", cfg.mqttPass);
   prefs.putString("mTopic", cfg.mqttTopic);
   prefs.putUShort("sleepMin", cfg.sleepMinutes);
+  prefs.putString("otaUrl", cfg.otaUrl);
   prefs.end();
 }
 
@@ -504,9 +514,149 @@ void goToSleep(uint64_t seconds) {
   esp_deep_sleep_start();
 }
 
-// Timer wake: take 3 photos, measure, send to the dashboard, sleep again.
+// ---------- Command check (before powering the camera / AI) ----------
+String pendingCommand;
+
+void onMqttMessage(char *topic, byte *payload, unsigned int length) {
+  pendingCommand = "";
+  for (unsigned i = 0; i < length && i < 32; ++i)
+    pendingCommand += (char)payload[i];
+  pendingCommand.trim();
+  pendingCommand.toLowerCase();
+}
+
+// Wakes Wi-Fi, reports "awake" to the dashboard and reads the retained
+// command on <topic>/<devId>/cmd. Returns true only for "ai" / "measure".
+bool checkDashboardCommand() {
+  if (cfg.ssid.isEmpty() || cfg.mqttHost.isEmpty()) {
+    Serial.println("Command: Wi-Fi/MQTT not configured -> no AI run");
+    return false;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+  uint32_t started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_TIMEOUT_MS)
+    delay(100);
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Command: Wi-Fi connect failed");
+    return false;
+  }
+  String base = cfg.mqttTopic + "/" + cfg.devId;
+  String statusTopic = base + "/status";
+  String cmdTopic = base + "/cmd";
+  mqtt.setServer(cfg.mqttHost.c_str(), cfg.mqttPort);
+  mqtt.setBufferSize(1024);
+  mqtt.setCallback(onMqttMessage);
+  String clientId = "plantcam-" + cfg.devId;
+  started = millis();
+  while (!mqtt.connected() && millis() - started < MQTT_TIMEOUT_MS) {
+    if (!mqtt.connect(clientId.c_str(), cfg.mqttUser.c_str(),
+                      cfg.mqttPass.c_str(), statusTopic.c_str(), 0, true,
+                      "sleeping"))
+      delay(500);
+  }
+  if (!mqtt.connected()) {
+    Serial.println("Command: MQTT connect failed");
+    return false;
+  }
+  pendingCommand = "";
+  mqtt.subscribe(cmdTopic.c_str());
+  started = millis();
+  while (pendingCommand.isEmpty() && millis() - started < CMD_WAIT_MS) {
+    mqtt.loop();
+    delay(20);
+  }
+  bool run = pendingCommand == "ai" || pendingCommand == "measure";
+  bool ota = pendingCommand == "ota";
+  String ping = "{\"dev\":\"" + cfg.devId + "\",\"fw\":\"" + FW_VERSION +
+                "\",\"cycle\":" + String(rtcCycles) +
+                ",\"rssi\":" + String(WiFi.RSSI()) +
+                ",\"sleep_min\":" + String(cfg.sleepMinutes) +
+                ",\"run_ai\":" + String(run ? "true" : "false") +
+                ",\"ota\":" + String(ota ? "true" : "false") + "}";
+  mqtt.publish((base + "/plantcam/ping").c_str(), ping.c_str());
+  mqtt.publish(statusTopic.c_str(),
+               run ? "measuring" : ota ? "updating" : "sleeping", true);
+  if (run || ota) // consume the one-shot command (clear the retained message)
+    mqtt.publish(cmdTopic.c_str(), (const uint8_t *)"", 0, true);
+  if (ota) {
+    for (int i = 0; i < 10; ++i) {
+      mqtt.loop();
+      delay(50);
+    }
+    String result = runOtaUpdate();
+    // The download can outlast the MQTT keepalive: reconnect to report.
+    if (!mqtt.connected())
+      mqtt.connect(clientId.c_str(), cfg.mqttUser.c_str(), cfg.mqttPass.c_str(),
+                   statusTopic.c_str(), 0, true, "sleeping");
+    mqtt.publish((base + "/plantcam/ota").c_str(), result.c_str());
+    mqtt.publish(statusTopic.c_str(), "sleeping", true);
+  }
+  // Give the TCP stack time to flush before the radio goes off.
+  for (int i = 0; i < 10; ++i) {
+    mqtt.loop();
+    delay(50);
+  }
+  mqtt.disconnect();
+  delay(100);
+  // Radio off while the camera and AI run (less heat, less current).
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.printf("Command: '%s' -> %s\n", pendingCommand.c_str(),
+                run ? "run AI" : "sleep");
+  if (ota && otaRebootPending) {
+    // New image is in the other OTA slot: boot it in AUTO mode (timer wake).
+    Serial.println("OTA: done, rebooting into new firmware");
+    goToSleep(1);
+  }
+  return run;
+}
+
+// Download firmware from the dashboard (HTTPS) into the spare OTA slot.
+// The server sends x-MD5, which HTTPUpdate checks before switching slots.
+String runOtaUpdate() {
+  if (cfg.otaUrl.isEmpty())
+    return "{\"ok\":false,\"error\":\"no OTA URL\"}";
+  String url = cfg.otaUrl + (cfg.otaUrl.indexOf('?') < 0 ? "?" : "&") +
+               "dev=" + cfg.devId + "&fw=" + FW_VERSION;
+  Serial.printf("OTA: %s\n", url.c_str());
+  httpUpdate.rebootOnUpdate(false);
+  t_httpUpdate_return r;
+  if (url.startsWith("https://")) {
+    WiFiClientSecure secure;
+    secure.setInsecure(); // integrity is checked with the server's MD5
+    secure.setTimeout(30);
+    r = httpUpdate.update(secure, url, FW_VERSION);
+  } else {
+    WiFiClient plain;
+    r = httpUpdate.update(plain, url, FW_VERSION);
+  }
+  String out;
+  if (r == HTTP_UPDATE_OK) {
+    otaRebootPending = true;
+    out = "{\"ok\":true,\"from\":\"" + String(FW_VERSION) + "\"}";
+  } else if (r == HTTP_UPDATE_NO_UPDATES) {
+    out = "{\"ok\":false,\"error\":\"no update available\"}";
+  } else {
+    String e = httpUpdate.getLastErrorString();
+    e.replace("\"", "'");
+    out = "{\"ok\":false,\"error\":\"" + e + "\"}";
+  }
+  Serial.printf("OTA: %s\n", out.c_str());
+  return out;
+}
+
+// Timer wake: run the camera + AI only when the dashboard asked for it.
 void runAutoCycle() {
   ++rtcCycles;
+  if (!checkDashboardCommand())
+    goToSleep((uint64_t)cfg.sleepMinutes * 60);
+  cameraReady = startCamera();
+  bool cardReady = cameraReady && startCard();
+  if (cardReady)
+    loadBaseline();
+  else
+    Serial.println(recorderStatus);
   bool ok = false;
   if (cameraReady && cardMounted) {
     startCaptureBatch();
@@ -569,8 +719,9 @@ void servePhoto(const char *path, bool noCache) {
 }
 
 void startWebServer() {
-  snprintf(accessPointName, sizeof(accessPointName), "PlantCam-%04lX",
-           (unsigned long)(esp_random() & 0xffff));
+  // Fixed name from the chip MAC (same suffix as the default devId).
+  snprintf(accessPointName, sizeof(accessPointName), "PlantCam-%s",
+           macId().c_str());
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   WiFi.softAP(accessPointName);
@@ -668,7 +819,8 @@ void startWebServer() {
                "\",\"mHost\":\"" + cfg.mqttHost + "\",\"mPort\":" +
                String(cfg.mqttPort) + ",\"mUser\":\"" + cfg.mqttUser +
                "\",\"mTopic\":\"" + cfg.mqttTopic + "\",\"sleepMin\":" +
-               String(cfg.sleepMinutes) + ",\"fw\":\"" + FW_VERSION + "\"}";
+               String(cfg.sleepMinutes) + ",\"otaUrl\":\"" + cfg.otaUrl +
+               "\",\"fw\":\"" + FW_VERSION + "\"}";
     server.send(200, "application/json", j);
   });
   server.on("/api/config", HTTP_POST, [] {
@@ -686,6 +838,8 @@ void startWebServer() {
       cfg.mqttPass = server.arg("mPass");
     if (server.arg("mTopic").length())
       cfg.mqttTopic = server.arg("mTopic");
+    if (server.hasArg("otaUrl"))
+      cfg.otaUrl = server.arg("otaUrl");
     long minutes = server.arg("sleepMin").toInt();
     if (minutes >= 1 && minutes <= 1440)
       cfg.sleepMinutes = minutes;
@@ -694,6 +848,45 @@ void startWebServer() {
     server.sendHeader("Location", "/");
     server.send(303, "text/plain", "");
   });
+  // Local OTA in setup mode: upload a .bin from the browser.
+  server.on("/update", HTTP_GET, [] {
+    lastWebActivity = millis();
+    server.send(200, "text/html; charset=utf-8",
+                "<meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                "<h2>อัปเดตเฟิร์มแวร์ PlantCam</h2><p>เวอร์ชันปัจจุบัน " +
+                    String(FW_VERSION) +
+                    "</p><form method=post enctype=multipart/form-data>"
+                    "<input type=file name=fw accept=.bin> <button>อัปโหลด</button></form>");
+  });
+  server.on(
+      "/update", HTTP_POST,
+      [] {
+        bool ok = !Update.hasError();
+        server.send(200, "text/html; charset=utf-8",
+                    ok ? "<meta charset=utf-8><p>อัปเดตสำเร็จ กำลังรีสตาร์ต...</p>"
+                       : "<meta charset=utf-8><p>อัปเดตไม่สำเร็จ: " +
+                             String(Update.errorString()) + "</p>");
+        if (ok) {
+          delay(500);
+          ESP.restart();
+        }
+      },
+      [] {
+        lastWebActivity = millis();
+        HTTPUpload &up = server.upload();
+        if (up.status == UPLOAD_FILE_START) {
+          Serial.printf("Local OTA: %s\n", up.filename.c_str());
+          Update.begin(UPDATE_SIZE_UNKNOWN);
+        } else if (up.status == UPLOAD_FILE_WRITE) {
+          Update.write(up.buf, up.currentSize);
+        } else if (up.status == UPLOAD_FILE_END) {
+          Update.end(true);
+          Serial.printf("Local OTA: %u bytes %s\n", up.totalSize,
+                        Update.hasError() ? Update.errorString() : "OK");
+        } else if (up.status == UPLOAD_FILE_ABORTED) {
+          Update.abort();
+        }
+      });
   server.on("/api/sleep", HTTP_POST, [] {
     server.send(200, "text/html; charset=utf-8",
                 "<meta charset=utf-8><p>เริ่มโหมดอัตโนมัติ บอร์ดจะวัด ส่งผล แล้วหลับ "
@@ -770,15 +963,12 @@ void setup() {
   loadConfig();
   Serial.printf("PlantCam FW %s, dev %s, %s mode\n", FW_VERSION,
                 cfg.devId.c_str(), autoMode ? "AUTO (timer wake)" : "SETUP");
+  if (autoMode)
+    runAutoCycle(); // never returns
   cameraReady = startCamera();
   bool cardReady = cameraReady && startCard();
   if (cardReady)
     loadBaseline();
-  if (autoMode) {
-    if (!cameraReady || !cardReady)
-      Serial.println(recorderStatus);
-    runAutoCycle(); // never returns
-  }
   lastWebActivity = millis();
   startWebServer();
   if (!cameraReady || !cardReady) {
