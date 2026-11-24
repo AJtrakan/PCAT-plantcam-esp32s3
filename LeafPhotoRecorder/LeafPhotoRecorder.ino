@@ -60,7 +60,7 @@ float batchConfidenceSum = 0;
 String recorderStatus = "Starting";
 
 // ---------- Deep sleep + dashboard ----------
-constexpr char FW_VERSION[] = "2.6.0";
+constexpr char FW_VERSION[] = "2.6.2";
 constexpr uint32_t SETUP_IDLE_MS = 10UL * 60 * 1000; // setup web idle -> sleep
 constexpr uint32_t WIFI_TIMEOUT_MS = 20000;
 constexpr uint32_t MQTT_TIMEOUT_MS = 10000;
@@ -90,6 +90,7 @@ bool sleepRequested = false;
 bool wifiFailed = false;      // STA connect failed -> open the setup AP
 bool setupRequested = false;  // dashboard sent "setup"
 bool setupFromTimer = false;  // setup AP opened after a timer wake
+bool resetRequested = false;  // dashboard sent "reset"
 
 const char WEB_PAGE[] PROGMEM = R"HTML(
 <!doctype html><html lang="th"><head><meta charset="utf-8">
@@ -209,11 +210,19 @@ void photoPath(unsigned number, char *output, size_t size) {
 }
 
 bool savePhoto(const camera_fb_t &frame) {
+  // Never overwrite: if the next number is already on the card (counter lost),
+  // move past the existing files.
+  char probe[72];
+  for (int guard = 0; guard < 10000; ++guard) {
+    photoPath(photoNumber + 1, probe, sizeof(probe));
+    if (!SD_MMC.exists(probe))
+      break;
+    ++photoNumber;
+  }
   char folder[48];
   snprintf(folder, sizeof(folder), "%s/%05u", sessionPath,
            photoNumber / PHOTOS_PER_FOLDER);
-  if (photoNumber % PHOTOS_PER_FOLDER == 0 && !SD_MMC.exists(folder) &&
-      !SD_MMC.mkdir(folder))
+  if (!SD_MMC.exists(folder) && !SD_MMC.mkdir(folder))
     return false;
   char finalPath[72], tempPath[72], vfsPath[88];
   photoPath(photoNumber + 1, finalPath, sizeof(finalPath));
@@ -570,7 +579,9 @@ bool publishResult(bool ok) {
                      "sleeping")) {
       publishLatestPhoto(base + "/plantcam/image");
       publishAnalysisImage(base + "/plantcam/result");
-      sent = mqtt.publish((base + "/plantcam").c_str(), payload.c_str(), true);
+      // Not retained: RabbitMQ may pass the retain flag on to live
+      // subscribers and the dashboard ignores retained (replayed) results.
+      sent = mqtt.publish((base + "/plantcam").c_str(), payload.c_str(), false);
       mqtt.publish(statusTopic.c_str(), "sleeping", true);
       mqtt.loop();
       delay(200);
@@ -595,8 +606,12 @@ void goToSleep(uint64_t seconds) {
   server.stop();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  rtcPhotoNumber = photoNumber;
-  rtcBatchNumber = batchNumber;
+  // Only a wake that opened the card knows the real counters; a command-check
+  // wake (no SD) must not overwrite them with 0.
+  if (cardMounted) {
+    rtcPhotoNumber = photoNumber;
+    rtcBatchNumber = batchNumber;
+  }
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -657,6 +672,11 @@ bool checkDashboardCommand() {
     delay(20);
   }
   bool run = pendingCommand == "ai" || pendingCommand == "measure";
+  // "reset": forget the baseline, start a new photo folder, measure now
+  // (that measurement becomes the new baseline).
+  resetRequested = pendingCommand == "reset";
+  if (resetRequested)
+    run = true;
   setupRequested = pendingCommand == "setup";
   // "sleep <minutes>": change the wake interval remotely (1-1440, saved in NVS)
   bool sleepCmd = pendingCommand.startsWith("sleep ");
@@ -702,12 +722,21 @@ void runAutoCycle() {
     return;
   if (!run)
     goToSleep((uint64_t)cfg.sleepMinutes * 60);
+  if (resetRequested)
+    rtcMagic = 0; // startCard() then opens a new run folder
   cameraReady = startCamera();
   bool cardReady = cameraReady && startCard();
-  if (cardReady)
+  if (cardReady && resetRequested) {
+    SD_MMC.remove("/lettuce/baseline.txt");
+    baselineCanopyPercent = NAN;
+    canopyPercent = NAN;
+    rtcCanopyPercent = NAN;
+    Serial.println("Reset: baseline cleared, new run folder");
+  } else if (cardReady) {
     loadBaseline();
-  else
+  } else {
     Serial.println(recorderStatus);
+  }
   bool ok = false;
   if (cameraReady && cardMounted) {
     startCaptureBatch();
