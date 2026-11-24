@@ -6,9 +6,6 @@
 #include <WiFi.h>
 #include <esp_camera.h>
 #include <esp_sleep.h>
-#include <HTTPUpdate.h>
-#include <Update.h>
-#include <WiFiClientSecure.h>
 #include <esp_random.h>
 #include <img_converters.h>
 #include <math.h>
@@ -24,6 +21,7 @@ constexpr int SD_D0 = 40;
 constexpr uint32_t INTERVAL_MS = 1000;
 constexpr uint32_t BLINK_MS = 100;
 constexpr unsigned PHOTOS_PER_FOLDER = 1000;
+constexpr uint8_t PHOTOS_PER_ROUND = 1; // photos taken + analysed per round
 constexpr int ROI_RADIUS = 96;
 constexpr int GREEN_MIN = 45;
 constexpr int GREEN_RED_MARGIN = 15;
@@ -62,7 +60,7 @@ float batchConfidenceSum = 0;
 String recorderStatus = "Starting";
 
 // ---------- Deep sleep + dashboard ----------
-constexpr char FW_VERSION[] = "2.4.2";
+constexpr char FW_VERSION[] = "2.6.0";
 constexpr uint32_t SETUP_IDLE_MS = 10UL * 60 * 1000; // setup web idle -> sleep
 constexpr uint32_t WIFI_TIMEOUT_MS = 20000;
 constexpr uint32_t MQTT_TIMEOUT_MS = 10000;
@@ -81,7 +79,6 @@ struct Config {
   String ssid, pass, devId, mqttHost, mqttUser, mqttPass, mqttTopic;
   uint16_t mqttPort = 1883;
   uint16_t sleepMinutes = 60;
-  String otaUrl;
 } cfg;
 
 Preferences prefs;
@@ -90,7 +87,6 @@ PubSubClient mqtt(netClient);
 bool autoMode = false;      // true = woke from timer: capture, send, sleep
 uint32_t lastWebActivity = 0;
 bool sleepRequested = false;
-bool otaRebootPending = false;
 bool wifiFailed = false;      // STA connect failed -> open the setup AP
 bool setupRequested = false;  // dashboard sent "setup"
 bool setupFromTimer = false;  // setup AP opened after a timer wake
@@ -102,9 +98,9 @@ const char WEB_PAGE[] PROGMEM = R"HTML(
 <body><div class="card"><h1>PlantCam เก็บภาพผัก</h1><p id="message">กำลังอ่านสถานะ…</p>
 <div class="stats"><div class="stat">สถานะ<br><b id="state">-</b></div><div class="stat">จำนวนภาพ<br><b id="count">0</b></div><div class="stat">พื้นที่ว่าง SD<br><b id="free">-</b></div><div class="stat">ข้อผิดพลาด<br><b id="errors">0</b></div></div>
 <div class="stats"><div class="stat">พื้นที่พุ่มล่าสุด<br><b id="canopy">-</b></div><div class="stat">เทียบครั้งก่อน<br><b id="previous">-</b></div><div class="stat">โตจากค่าเริ่มต้น<br><b id="baseline">-</b></div><div class="stat">AI ตรวจพบ<br><b id="ai">-</b></div></div>
-<p><form method="post" action="/api/capture" style="display:inline"><button type="submit">ถ่าย 3 รูป</button></form><a id="download" href="/latest.jpg" download>ดาวน์โหลดภาพล่าสุด</a></p>
+<p><form method="post" action="/api/capture" style="display:inline"><button type="submit">ถ่ายรูป + วัดพุ่ม</button></form><a id="download" href="/latest.jpg" download>ดาวน์โหลดภาพล่าสุด</a></p>
 <p><form method="post" action="/api/baseline" style="display:inline"><button type="submit">ตั้งค่าพุ่มล่าสุดเป็นค่าเริ่มต้น</button></form></p>
-<p class="muted">กดหนึ่งครั้งเพื่อถ่าย 3 รูป ห่างกันรูปละ 1 วินาที • GPIO2 กะพริบเมื่อบันทึกสำเร็จ</p></div>
+<p class="muted">กดหนึ่งครั้งเพื่อถ่าย 1 รูปแล้ววัดพุ่มด้วย AI • GPIO2 กะพริบเมื่อบันทึกสำเร็จ</p></div>
 <div class="card"><h2>ตั้งค่าส่งผลไปแดชบอร์ด + โหมดหลับ</h2>
 <form method="post" action="/api/config" class="cfg">
 <label>Wi-Fi SSID<input name="ssid" id="c_ssid"></label><label>Wi-Fi รหัสผ่าน<input name="pass" type="password" placeholder="(เว้นว่าง = ใช้ค่าเดิม)"></label>
@@ -112,17 +108,16 @@ const char WEB_PAGE[] PROGMEM = R"HTML(
 <label>MQTT port<input name="mPort" id="c_mPort" type="number"></label><label>MQTT user<input name="mUser" id="c_mUser"></label>
 <label>MQTT รหัสผ่าน<input name="mPass" type="password" placeholder="(เว้นว่าง = ใช้ค่าเดิม)"></label><label>MQTT topic prefix<input name="mTopic" id="c_mTopic"></label>
 <label>ตื่นมาเช็คคำสั่งทุก (นาที)<input name="sleepMin" id="c_sleepMin" type="number" min="1" max="1440"></label>
-<label>OTA URL (เฟิร์มแวร์จากแดชบอร์ด)<input name="otaUrl" id="c_otaUrl"></label>
 <button type="submit">บันทึกการตั้งค่า</button></form>
 <form method="post" action="/api/sleep"><button type="submit" style="background:#8a4b00">เริ่มทำงานอัตโนมัติ (วัด → ส่ง → หลับ)</button></form>
-<p class="muted">ผลส่งไปที่ topic <b id="c_topic">-</b> • ถ้าไม่มีการใช้งานหน้าเว็บ 10 นาที บอร์ดจะเริ่มโหมดอัตโนมัติเอง • กด RST เพื่อกลับมาหน้านี้ • <a href="/update" style="background:#555">อัปเดตเฟิร์มแวร์ (OTA)</a></p></div>
+<p class="muted">ผลส่งไปที่ topic <b id="c_topic">-</b> • ถ้าไม่มีการใช้งานหน้าเว็บ 10 นาที บอร์ดจะเริ่มโหมดอัตโนมัติเอง • กด RST เพื่อกลับมาหน้านี้</p></div>
 <div class="card"><h2>ภาพตัวอย่างสด</h2><div class="preview-wrap"><img id="preview" src="/preview.jpg" alt="กำลังเปิดกล้อง"><div class="roi" id="roi" style="display:none"></div></div><p class="muted">หลังถ่าย วงกลมจะแสดงบริเวณที่ AI พบต้นและใช้วัดพุ่ม ภาพตัวอย่างไม่ถูกบันทึกลง SD</p></div>
 <div class="card"><h2>ภาพล่าสุด</h2><img id="latest" alt="ยังไม่มีภาพ"></div>
 <div class="card"><h2>12 ภาพล่าสุด</h2><div class="gallery" id="gallery"></div></div>
 <script>
 const stateText=document.getElementById('state'),countText=document.getElementById('count'),errorText=document.getElementById('errors'),freeText=document.getElementById('free'),messageText=document.getElementById('message'),canopyText=document.getElementById('canopy'),previousText=document.getElementById('previous'),baselineText=document.getElementById('baseline'),aiText=document.getElementById('ai'),roi=document.getElementById('roi'),previewImage=document.getElementById('preview'),latestImage=document.getElementById('latest'),downloadLink=document.getElementById('download'),galleryBox=document.getElementById('gallery');let lastCount=-1,isCapturing=false;
 async function refresh(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());isCapturing=s.recording;stateText.textContent=s.recording?'กำลังถ่ายชุด ('+s.remaining+' รูป)':'พร้อมถ่าย';countText.textContent=s.photos;errorText.textContent=s.errors;freeText.textContent=s.sd_free_mb===null?'-':s.sd_free_mb+' MB';messageText.textContent=s.message;canopyText.textContent=s.canopy_percent===null?'-':s.canopy_percent.toFixed(2)+'%';previousText.textContent=s.change_previous_percent===null?'-':(s.change_previous_percent>=0?'+':'')+s.change_previous_percent.toFixed(2)+'%';baselineText.textContent=s.growth_baseline_percent===null?'-':(s.growth_baseline_percent>=0?'+':'')+s.growth_baseline_percent.toFixed(2)+'%';aiText.textContent=s.ai_state==='plant_found'?(s.ai_confidence*100).toFixed(1)+'%':s.ai_state;if(s.ai_x!==null){roi.style.display='block';roi.style.left=((s.ai_x-96)/320*100)+'%';roi.style.top=((s.ai_y-96)/240*100)+'%'}else roi.style.display='none';if(s.photos>0){latestImage.src='/latest.jpg?v='+s.photos;downloadLink.href='/latest.jpg?v='+s.photos}if(s.photos!==lastCount){lastCount=s.photos;const a=await fetch('/api/recent',{cache:'no-store'}).then(r=>r.json());galleryBox.replaceChildren(...a.map(x=>{const l=document.createElement('a');l.href=x.url;l.target='_blank';const i=document.createElement('img');i.src=x.url;i.loading='lazy';i.alt='ภาพ '+x.number;l.append(i);return l}))}}catch(e){messageText.textContent='เชื่อมต่อบอร์ดไม่ได้'}}function refreshPreview(){if(!isCapturing)previewImage.src='/preview.jpg?t='+Date.now()}refresh();setInterval(refresh,1000);setInterval(refreshPreview,800);
-fetch('/api/config',{cache:'no-store'}).then(r=>r.json()).then(c=>{for(const k of ['ssid','devId','mHost','mPort','mUser','mTopic','sleepMin','otaUrl'])document.getElementById('c_'+k).value=c[k];document.getElementById('c_topic').textContent=c.mTopic+'/'+c.devId+'/plantcam'}).catch(()=>{});
+fetch('/api/config',{cache:'no-store'}).then(r=>r.json()).then(c=>{for(const k of ['ssid','devId','mHost','mPort','mUser','mTopic','sleepMin'])document.getElementById('c_'+k).value=c[k];document.getElementById('c_topic').textContent=c.mTopic+'/'+c.devId+'/plantcam'}).catch(()=>{});
 </script></body></html>)HTML";
 
 bool startCamera() {
@@ -239,6 +234,53 @@ bool savePhoto(const camera_fb_t &frame) {
   return true;
 }
 
+// ---------- Analysis image (what the AI + canopy measurement saw) ----------
+uint8_t *analysisJpg = nullptr; // JPEG of the last analysed photo (malloc'd)
+size_t analysisJpgLen = 0;
+
+void clearAnalysisImage() {
+  free(analysisJpg);
+  analysisJpg = nullptr;
+  analysisJpgLen = 0;
+}
+
+void putPixel(int x, int y, uint8_t c0, uint8_t c1, uint8_t c2) {
+  if (x < 0 || x >= 320 || y < 0 || y >= 240)
+    return;
+  size_t p = (y * 320 + x) * 3;
+  rgbBuffer[p] = c0;
+  rgbBuffer[p + 1] = c1;
+  rgbBuffer[p + 2] = c2;
+}
+
+// Yellow ROI circle + red cross at the plant centre found by the AI.
+// Channel order follows fmt2rgb888 on this core (B, G, R).
+void drawAnalysisMarks() {
+  for (int a = 0; a < 720; ++a) {
+    float t = a * (float)M_PI / 360.0f;
+    int x = plantCenterX + (int)lroundf(ROI_RADIUS * cosf(t));
+    int y = plantCenterY + (int)lroundf(ROI_RADIUS * sinf(t));
+    putPixel(x, y, 0, 255, 255);
+    putPixel(x + 1, y, 0, 255, 255);
+  }
+  for (int d = -8; d <= 8; ++d)
+    for (int w = -1; w <= 1; ++w) {
+      putPixel(plantCenterX + d, plantCenterY + w, 0, 0, 255);
+      putPixel(plantCenterX + w, plantCenterY + d, 0, 0, 255);
+    }
+}
+
+void encodeAnalysisImage() {
+  uint8_t *jpg = nullptr;
+  size_t len = 0;
+  if (fmt2jpg(rgbBuffer, 320 * 240 * 3, 320, 240, PIXFORMAT_RGB888, 80, &jpg,
+              &len)) {
+    clearAnalysisImage();
+    analysisJpg = jpg;
+    analysisJpgLen = len;
+  }
+}
+
 bool measureCanopy(const camera_fb_t &frame, uint32_t &greenPixels,
                    uint32_t &roiPixels) {
   if (frame.width != 320 || frame.height != 240 ||
@@ -257,22 +299,38 @@ bool measureCanopy(const camera_fb_t &frame, uint32_t &greenPixels,
   plantConfidence = detectedConfidence;
   greenPixels = 0;
   roiPixels = 0;
+  // Count canopy pixels and, in the same pass, paint the analysis image:
+  // canopy pixels bright green, rest of the ROI dimmed, outside the ROI dark.
   for (int y = 0; y < 240; ++y) {
     int dy = y - plantCenterY;
     for (int x = 0; x < 320; ++x) {
       int dx = x - plantCenterX;
-      if (dx * dx + dy * dy > ROI_RADIUS * ROI_RADIUS)
-        continue;
       size_t pixel = (y * 320 + x) * 3;
+      if (dx * dx + dy * dy > ROI_RADIUS * ROI_RADIUS) {
+        rgbBuffer[pixel] /= 4;
+        rgbBuffer[pixel + 1] /= 4;
+        rgbBuffer[pixel + 2] /= 4;
+        continue;
+      }
       int redOrBlue1 = rgbBuffer[pixel];
       int green = rgbBuffer[pixel + 1];
       int redOrBlue2 = rgbBuffer[pixel + 2];
       ++roiPixels;
       if (green >= GREEN_MIN && green - redOrBlue1 >= GREEN_RED_MARGIN &&
-          green - redOrBlue2 >= GREEN_BLUE_MARGIN)
+          green - redOrBlue2 >= GREEN_BLUE_MARGIN) {
         ++greenPixels;
+        rgbBuffer[pixel] = redOrBlue1 / 3;
+        rgbBuffer[pixel + 1] = 255;
+        rgbBuffer[pixel + 2] = redOrBlue2 / 3;
+      } else {
+        rgbBuffer[pixel] = redOrBlue1 / 2;
+        rgbBuffer[pixel + 1] = green / 2;
+        rgbBuffer[pixel + 2] = redOrBlue2 / 2;
+      }
     }
   }
+  drawAnalysisMarks();
+  encodeAnalysisImage();
   return roiPixels > 0;
 }
 
@@ -310,7 +368,7 @@ void appendCanopyMeasurement() {
                  "green_pixels,roi_pixels,canopy_percent,change_previous_percent,"
                  "growth_baseline_percent,ai_x,ai_y,ai_confidence");
   file.printf("%s,%u,%lu,%u,%u,%u,%llu,%llu,%.4f,", sessionPath, batchNumber,
-              (unsigned long)millis(), photoNumber - 2, photoNumber,
+              (unsigned long)millis(), photoNumber - (validMeasurements ? batchAnalysed : 1) + 1, photoNumber,
               validMeasurements, batchGreenPixels, batchRoiPixels,
               canopyPercent);
   if (isfinite(changeFromPrevious))
@@ -350,7 +408,7 @@ void finishMeasurementBatch() {
           : NAN;
   appendCanopyMeasurement();
   rtcCanopyPercent = canopyPercent;
-  recorderStatus = "AI found plant; 3 photos saved and canopy measured";
+  recorderStatus = "AI found plant; photo saved and canopy measured";
 }
 
 // ---------- Config (NVS) ----------
@@ -372,8 +430,6 @@ void loadConfig() {
   cfg.mqttPass = prefs.getString("mPass", "");
   cfg.mqttTopic = prefs.getString("mTopic", "PCAT_Kit");
   cfg.sleepMinutes = prefs.getUShort("sleepMin", 60);
-  cfg.otaUrl = prefs.getString(
-      "otaUrl", "https://iot.pcat.in.th/Smart_PCAT/api/plantcam/firmware");
   prefs.end();
   if (cfg.devId.isEmpty())
     cfg.devId = "CAM" + macId();
@@ -396,7 +452,6 @@ void saveConfig() {
   prefs.putString("mPass", cfg.mqttPass);
   prefs.putString("mTopic", cfg.mqttTopic);
   prefs.putUShort("sleepMin", cfg.sleepMinutes);
-  prefs.putString("otaUrl", cfg.otaUrl);
   prefs.end();
 }
 
@@ -465,6 +520,24 @@ bool publishLatestPhoto(const String &topic) {
   return ok;
 }
 
+// Send the analysis image (ROI circle, plant centre, canopy pixels).
+bool publishAnalysisImage(const String &topic) {
+  if (!analysisJpg || !analysisJpgLen ||
+      !mqtt.beginPublish(topic.c_str(), analysisJpgLen, false))
+    return false;
+  size_t sent = 0;
+  while (sent < analysisJpgLen) {
+    size_t n = analysisJpgLen - sent > 1024 ? 1024 : analysisJpgLen - sent;
+    if (mqtt.write(analysisJpg + sent, n) != n)
+      break;
+    sent += n;
+  }
+  bool ok = mqtt.endPublish() && sent == analysisJpgLen;
+  Serial.printf("Dashboard: analysis image %s (%u bytes)\n", ok ? "sent" : "failed",
+                (unsigned)analysisJpgLen);
+  return ok;
+}
+
 // Connect to the farm Wi-Fi and publish the result (retained) to
 // <topic>/<devId>/plantcam. Returns true when the broker accepted it.
 bool publishResult(bool ok) {
@@ -472,8 +545,10 @@ bool publishResult(bool ok) {
     Serial.println("Dashboard: Wi-Fi/MQTT not configured, skip send");
     return false;
   }
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+  }
   uint32_t started = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_TIMEOUT_MS)
     delay(100);
@@ -494,6 +569,7 @@ bool publishResult(bool ok) {
                      cfg.mqttPass.c_str(), statusTopic.c_str(), 0, true,
                      "sleeping")) {
       publishLatestPhoto(base + "/plantcam/image");
+      publishAnalysisImage(base + "/plantcam/result");
       sent = mqtt.publish((base + "/plantcam").c_str(), payload.c_str(), true);
       mqtt.publish(statusTopic.c_str(), "sleeping", true);
       mqtt.loop();
@@ -581,7 +657,6 @@ bool checkDashboardCommand() {
     delay(20);
   }
   bool run = pendingCommand == "ai" || pendingCommand == "measure";
-  bool ota = pendingCommand == "ota";
   setupRequested = pendingCommand == "setup";
   // "sleep <minutes>": change the wake interval remotely (1-1440, saved in NVS)
   bool sleepCmd = pendingCommand.startsWith("sleep ");
@@ -597,26 +672,12 @@ bool checkDashboardCommand() {
                 "\",\"cycle\":" + String(rtcCycles) +
                 ",\"rssi\":" + String(WiFi.RSSI()) +
                 ",\"sleep_min\":" + String(cfg.sleepMinutes) +
-                ",\"run_ai\":" + String(run ? "true" : "false") +
-                ",\"ota\":" + String(ota ? "true" : "false") + "}";
+                ",\"run_ai\":" + String(run ? "true" : "false") + "}";
   mqtt.publish((base + "/plantcam/ping").c_str(), ping.c_str());
   mqtt.publish(statusTopic.c_str(),
-               run ? "measuring" : ota ? "updating" : "sleeping", true);
-  if (run || ota || setupRequested || sleepCmd) // consume the one-shot command (clear the retained message)
+               run ? "measuring" : "sleeping", true);
+  if (run || setupRequested || sleepCmd) // consume the one-shot command (clear the retained message)
     mqtt.publish(cmdTopic.c_str(), (const uint8_t *)"", 0, true);
-  if (ota) {
-    for (int i = 0; i < 10; ++i) {
-      mqtt.loop();
-      delay(50);
-    }
-    String result = runOtaUpdate();
-    // The download can outlast the MQTT keepalive: reconnect to report.
-    if (!mqtt.connected())
-      mqtt.connect(clientId.c_str(), cfg.mqttUser.c_str(), cfg.mqttPass.c_str(),
-                   statusTopic.c_str(), 0, true, "sleeping");
-    mqtt.publish((base + "/plantcam/ota").c_str(), result.c_str());
-    mqtt.publish(statusTopic.c_str(), "sleeping", true);
-  }
   // Give the TCP stack time to flush before the radio goes off.
   for (int i = 0; i < 10; ++i) {
     mqtt.loop();
@@ -629,46 +690,7 @@ bool checkDashboardCommand() {
   WiFi.mode(WIFI_OFF);
   Serial.printf("Command: '%s' -> %s\n", pendingCommand.c_str(),
                 run ? "run AI" : "sleep");
-  if (ota && otaRebootPending) {
-    // New image is in the other OTA slot: boot it in AUTO mode (timer wake).
-    Serial.println("OTA: done, rebooting into new firmware");
-    goToSleep(1);
-  }
   return run;
-}
-
-// Download firmware from the dashboard (HTTPS) into the spare OTA slot.
-// The server sends x-MD5, which HTTPUpdate checks before switching slots.
-String runOtaUpdate() {
-  if (cfg.otaUrl.isEmpty())
-    return "{\"ok\":false,\"error\":\"no OTA URL\"}";
-  String url = cfg.otaUrl + (cfg.otaUrl.indexOf('?') < 0 ? "?" : "&") +
-               "dev=" + cfg.devId + "&fw=" + FW_VERSION;
-  Serial.printf("OTA: %s\n", url.c_str());
-  httpUpdate.rebootOnUpdate(false);
-  t_httpUpdate_return r;
-  if (url.startsWith("https://")) {
-    WiFiClientSecure secure;
-    secure.setInsecure(); // integrity is checked with the server's MD5
-    secure.setTimeout(30);
-    r = httpUpdate.update(secure, url, FW_VERSION);
-  } else {
-    WiFiClient plain;
-    r = httpUpdate.update(plain, url, FW_VERSION);
-  }
-  String out;
-  if (r == HTTP_UPDATE_OK) {
-    otaRebootPending = true;
-    out = "{\"ok\":true,\"from\":\"" + String(FW_VERSION) + "\"}";
-  } else if (r == HTTP_UPDATE_NO_UPDATES) {
-    out = "{\"ok\":false,\"error\":\"no update available\"}";
-  } else {
-    String e = httpUpdate.getLastErrorString();
-    e.replace("\"", "'");
-    out = "{\"ok\":false,\"error\":\"" + e + "\"}";
-  }
-  Serial.printf("OTA: %s\n", out.c_str());
-  return out;
 }
 
 // Timer wake: run the camera + AI only when the dashboard asked for it.
@@ -696,7 +718,7 @@ void runAutoCycle() {
         esp_camera_fb_return(warm);
     }
     uint8_t attempts = 0;
-    while (recording && attempts++ < 6) {
+    while (recording && attempts++ < PHOTOS_PER_ROUND * 2) {
       uint32_t t = millis();
       captureAndSave();
       digitalWrite(LED_PIN, LED_OFF);
@@ -716,7 +738,8 @@ void runAutoCycle() {
 void startCaptureBatch() {
   if (!cardMounted || recording)
     return;
-  photosRemaining = 3;
+  photosRemaining = PHOTOS_PER_ROUND;
+  clearAnalysisImage();
   validMeasurements = 0;
   batchAnalysed = 0;
   batchGreenPixels = 0;
@@ -729,7 +752,7 @@ void startCaptureBatch() {
   plantConfidence = 0;
   recording = true;
   nextCapture = millis();
-  recorderStatus = "Capturing 3 photos";
+  recorderStatus = "Capturing";
 }
 
 void servePhoto(const char *path, bool noCache) {
@@ -753,8 +776,8 @@ void startWebServer() {
   snprintf(accessPointName, sizeof(accessPointName), "PlantCam-%s",
            macId().c_str());
   WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
   WiFi.softAP(accessPointName);
+  WiFi.setSleep(false);
   server.on("/", HTTP_GET,
             [] { server.send_P(200, "text/html; charset=utf-8", WEB_PAGE); });
   server.on("/preview.jpg", HTTP_GET, [] {
@@ -849,8 +872,7 @@ void startWebServer() {
                "\",\"mHost\":\"" + cfg.mqttHost + "\",\"mPort\":" +
                String(cfg.mqttPort) + ",\"mUser\":\"" + cfg.mqttUser +
                "\",\"mTopic\":\"" + cfg.mqttTopic + "\",\"sleepMin\":" +
-               String(cfg.sleepMinutes) + ",\"otaUrl\":\"" + cfg.otaUrl +
-               "\",\"fw\":\"" + FW_VERSION + "\"}";
+               String(cfg.sleepMinutes) + ",\"fw\":\"" + FW_VERSION + "\"}";
     server.send(200, "application/json", j);
   });
   server.on("/api/config", HTTP_POST, [] {
@@ -868,8 +890,6 @@ void startWebServer() {
       cfg.mqttPass = server.arg("mPass");
     if (server.arg("mTopic").length())
       cfg.mqttTopic = server.arg("mTopic");
-    if (server.hasArg("otaUrl"))
-      cfg.otaUrl = server.arg("otaUrl");
     long minutes = server.arg("sleepMin").toInt();
     if (minutes >= 1 && minutes <= 1440)
       cfg.sleepMinutes = minutes;
@@ -878,45 +898,6 @@ void startWebServer() {
     server.sendHeader("Location", "/");
     server.send(303, "text/plain", "");
   });
-  // Local OTA in setup mode: upload a .bin from the browser.
-  server.on("/update", HTTP_GET, [] {
-    lastWebActivity = millis();
-    server.send(200, "text/html; charset=utf-8",
-                "<meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                "<h2>อัปเดตเฟิร์มแวร์ PlantCam</h2><p>เวอร์ชันปัจจุบัน " +
-                    String(FW_VERSION) +
-                    "</p><form method=post enctype=multipart/form-data>"
-                    "<input type=file name=fw accept=.bin> <button>อัปโหลด</button></form>");
-  });
-  server.on(
-      "/update", HTTP_POST,
-      [] {
-        bool ok = !Update.hasError();
-        server.send(200, "text/html; charset=utf-8",
-                    ok ? "<meta charset=utf-8><p>อัปเดตสำเร็จ กำลังรีสตาร์ต...</p>"
-                       : "<meta charset=utf-8><p>อัปเดตไม่สำเร็จ: " +
-                             String(Update.errorString()) + "</p>");
-        if (ok) {
-          delay(500);
-          ESP.restart();
-        }
-      },
-      [] {
-        lastWebActivity = millis();
-        HTTPUpload &up = server.upload();
-        if (up.status == UPLOAD_FILE_START) {
-          Serial.printf("Local OTA: %s\n", up.filename.c_str());
-          Update.begin(UPDATE_SIZE_UNKNOWN);
-        } else if (up.status == UPLOAD_FILE_WRITE) {
-          Update.write(up.buf, up.currentSize);
-        } else if (up.status == UPLOAD_FILE_END) {
-          Update.end(true);
-          Serial.printf("Local OTA: %u bytes %s\n", up.totalSize,
-                        Update.hasError() ? Update.errorString() : "OK");
-        } else if (up.status == UPLOAD_FILE_ABORTED) {
-          Update.abort();
-        }
-      });
   server.on("/api/sleep", HTTP_POST, [] {
     server.send(200, "text/html; charset=utf-8",
                 "<meta charset=utf-8><p>เริ่มโหมดอัตโนมัติ บอร์ดจะวัด ส่งผล แล้วหลับ "
@@ -973,7 +954,7 @@ void captureAndSave() {
     recording = false;
     finishMeasurementBatch();
   } else {
-    recorderStatus = "Capturing 3 photos";
+    recorderStatus = "Capturing";
   }
   digitalWrite(LED_PIN, LED_ON);
   ledLit = true;
@@ -1016,7 +997,7 @@ void setup() {
                        : "Cannot connect to Wi-Fi '" + cfg.ssid +
                              "' - check settings below";
   recording = false;
-  Serial.printf("Ready at %s. Send c to capture 3 photos.\n", sessionPath);
+  Serial.printf("Ready at %s. Send c to capture.\n", sessionPath);
 }
 
 void loop() {

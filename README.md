@@ -17,7 +17,7 @@
 
 ## ติดตั้งและใช้งาน
 
-1. ใช้ Arduino IDE กับ Arduino-ESP32 3.3.12 เลือก **ESP32S3 Dev Module**, Flash **16MB**, **OPI PSRAM** และพาร์ทิชัน **16M Flash (3MB APP/9.9MB FATFS)** (รองรับ OTA)
+1. ใช้ Arduino IDE กับ Arduino-ESP32 3.3.12 เลือก **ESP32S3 Dev Module**, Flash **16MB**, **OPI PSRAM** และพาร์ทิชัน **16M Flash (3MB APP/9.9MB FATFS)**
 2. ติดตั้ง [Arduino Library ของโมเดล int8 v2](model/plant_fomo_int8_arduino_v2.zip) ผ่าน **Sketch → Include Library → Add .ZIP Library**
 3. เปิด [LeafPhotoRecorder.ino](LeafPhotoRecorder/LeafPhotoRecorder.ino) แล้วอัปโหลด สำหรับช่อง USB-UART ตั้ง **USB CDC On Boot: Disabled** จากนั้นเปิด Serial Monitor ที่ 115200 baud
 4. ใส่ microSD แบบ FAT32 ต่อ Wi‑Fi ชื่อ `PlantCam-<MAC>` แล้วเปิด [หน้าเว็บบนบอร์ด](http://192.168.4.1) เพื่อดูภาพตัวอย่างและสั่งถ่าย
